@@ -134,7 +134,7 @@ def match_local_advertisement(
             detected_at,
             rssi,
         )
-    except IndexError, ValueError:
+    except (IndexError, ValueError, OverflowError):
         return None
 
     if isinstance(device, NearbyOfflineFindingDevice):
