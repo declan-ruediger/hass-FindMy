@@ -58,6 +58,10 @@ _LOCAL_ALIGNMENT_UPDATE_DELAY = 60
 # The key index advances every 15 minutes; persisting it on every rollover rewrites
 # core.config_entries for each accessory, so the saved alignment only trails by up to an hour.
 _LOCAL_ALIGNMENT_SAVE_DELAY = 60 * 60
+# Matcher watchdog: Apple/DULT advertisements keep arriving but none
+# matches for this long -> rebuild candidates from the persisted snapshot.
+_LOCAL_MATCH_WATCHDOG_DELAY = 60 * 30
+_LOCAL_WATCHDOG_HEAL_COOLDOWN = 60 * 30
 
 
 async def async_setup_entry(
@@ -106,6 +110,8 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         self._last_local_state_update = 0.0
         self._last_alignment_update = 0.0
         self._last_alignment_save = 0.0
+        self._last_match_time = 0.0
+        self._last_watchdog_heal = 0.0
 
         # Define entity id
         # Set here instead of in a property because it needs a setter, so this is more convenient.
@@ -159,6 +165,7 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         )
         self.async_on_remove(self._cancel_local_refresh_tasks)
 
+        self._last_match_time = monotonic()
         self._schedule_local_candidate_refresh("initial")
 
     @override
@@ -175,16 +182,20 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         self._local_refresh_tasks.clear()
 
     @callback
-    def _schedule_local_candidate_refresh(self, reason: str) -> None:
+    def _schedule_local_candidate_refresh(
+        self, reason: str, *, from_persisted: bool = False
+    ) -> None:
         """Schedule candidate generation and retain the task until completion."""
         task = self.hass.async_create_task(
-            self._async_refresh_local_candidates(),
+            self._async_refresh_local_candidates(from_persisted=from_persisted),
             f"findmy local key cache ({reason}): {self.unique_id}",
         )
         self._local_refresh_tasks.add(task)
         task.add_done_callback(self._local_refresh_tasks.discard)
 
-    async def _async_refresh_local_candidates(self, _now: datetime | None = None) -> None:
+    async def _async_refresh_local_candidates(
+        self, _now: datetime | None = None, *, from_persisted: bool = False
+    ) -> None:
         """Generate rolling-key candidates outside Home Assistant's event loop."""
         if not isinstance(self._device, FindMyAccessory):
             return
@@ -192,6 +203,14 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
         async with self._local_refresh_lock:
             observed_at = datetime.now(tz=UTC)
             accessory_data = self._device.to_json()
+            if from_persisted:
+                entry = self.hass.config_entries.async_get_entry(self._entry_id)
+                if entry is not None and entry.data.get("type") == "device_rolling_derived":
+                    accessory_data = entry.data["data"]
+                    _LOGGER.warning(
+                        "Watchdog: rebuilding candidates for %s from the persisted accessory snapshot",
+                        self.given_name,
+                    )
             candidates = await self.hass.async_add_executor_job(
                 build_candidate_key_lookup_from_json,
                 accessory_data,
@@ -230,6 +249,39 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
                     service_info,
                     bluetooth.BluetoothChange.ADVERTISEMENT,
                 )
+
+    @callback
+    def _maybe_self_heal(
+        self, service_info: bluetooth.BluetoothServiceInfoBleak
+    ) -> None:
+        """Rebuild candidates from persisted state when matching goes silent.
+
+        Advertisements keep arriving but none matches: regenerate the candidate
+        window from the persisted accessory snapshot - the same state a restart
+        loads, which restores matching - then let the next matched observation
+        re-align the live device.
+        """
+        if not self._last_match_time:
+            return
+        now_mono = monotonic()
+        stale = now_mono - self._last_match_time
+        if stale < _LOCAL_MATCH_WATCHDOG_DELAY:
+            return
+        if now_mono - self._last_watchdog_heal < _LOCAL_WATCHDOG_HEAL_COOLDOWN:
+            return
+        if (
+            APPLE_COMPANY_ID not in service_info.manufacturer_data
+            and DULT_SERVICE_UUID not in service_info.service_data
+        ):
+            return
+        self._last_watchdog_heal = now_mono
+        _LOGGER.warning(
+            "No local match for %s for %i min while advertisements are arriving; "
+            "rebuilding rolling-key candidates from persisted state",
+            self.given_name,
+            stale // 60,
+        )
+        self._schedule_local_candidate_refresh("match-watchdog", from_persisted=True)
 
     def _match_service_info(
         self,
@@ -274,8 +326,9 @@ class FindMyDeviceTracker(  # pyright: ignore [reportUninitializedInstanceVariab
 
         observation = self._match_service_info(service_info)
         if observation is None:
+            self._maybe_self_heal(service_info)
             return
-
+        self._last_match_time = monotonic()
         previous = self._local_observation
         if previous is not None and observation.detected_at < previous.detected_at:
             # Bluetooth history can still hold the address from before the last key rotation.
